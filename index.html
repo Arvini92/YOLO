@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AeroWheat Diagnostics Framework</title>
+    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: #0b0f12;
+            color: #e2e8f0;
+            padding: 30px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        h1 { color: #4ade80; margin-bottom: 5px; }
+        .subtitle { color: #64748b; margin-top: 0; margin-bottom: 25px; }
+        
+        .controls { 
+            background: #141b22; 
+            padding: 15px 25px; 
+            border-radius: 8px; 
+            margin-bottom: 15px;
+            border: 1px solid #222f3d;
+        }
+        input[type="file"] { color: #94a3b8; font-weight: 500; }
+        
+        #status-hud { 
+            color: #38bdf8; 
+            font-weight: 500; 
+            margin-bottom: 20px; 
+            font-family: monospace; 
+            background: #0f172a;
+            padding: 8px 16px;
+            border-radius: 4px;
+        }
+        
+        .stage-container {
+            position: relative;
+            border-radius: 8px;
+            overflow: hidden;
+            box-shadow: 0 15px 35px -5px rgba(0,0,0,0.8);
+            background: #1e293b;
+            display: none;
+        }
+        #input-image {
+            display: block;
+            max-width: 500px;
+            height: auto;
+        }
+        #output-canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+        }
+    </style>
+</head>
+<body>
+
+    <h1>AeroWheat Leaf Disease Diagnostics</h1>
+    <p class="subtitle">YOLO26 Cluster Merging Vision Sandbox</p>
+
+    <div class="controls">
+        <input type="file" id="file-selector" accept="image/*" disabled>
+    </div>
+    
+    <div id="status-hud">Initializing ONNX WebAssembly Graph...</div>
+
+    <div class="stage-container" id="stage">
+        <img id="input-image" alt="Wheat Diagnostic Input Target" />
+        <canvas id="output-canvas"></canvas>
+    </div>
+
+    <script>
+        const CONFIG = {
+            modelPath: './best.onnx', 
+            imgSize: 640,
+            confThreshold: 0.25,      
+            iouThreshold: 0.30,       
+            classes: ['healthy', 'rust', 'septoria'],
+            colors: ['#22c55e', '#ef4444', '#f59e0b'] 
+        };
+
+        let session = null;
+        let letterboxScale = 1;
+        let padX = 0;
+        let padY = 0;
+
+        const fileSelector = document.getElementById('file-selector');
+        const statusHud = document.getElementById('status-hud');
+        const inputImg = document.getElementById('input-image');
+        const outputCanvas = document.getElementById('output-canvas');
+        const stage = document.getElementById('stage');
+
+        async function initModelEngine() {
+            try {
+                statusHud.textContent = "Loading WebAssembly Graph Engine...";
+                session = await ort.InferenceSession.create(CONFIG.modelPath);
+                statusHud.textContent = "Engine Online. Ready for leaf diagnostics.";
+                fileSelector.disabled = false;
+            } catch (err) {
+                statusHud.textContent = `Error: Verify 'best.onnx' is hosted via a local server in this directory.`;
+                console.error(err);
+            }
+        }
+
+        fileSelector.addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+            
+            const reader = new FileReader();
+            reader.onload = (event) => {
+                inputImg.src = event.target.result;
+                inputImg.onload = () => {
+                    stage.style.display = 'block';
+                    runDiagnostics();
+                };
+            };
+            reader.readAsDataURL(file);
+        });
+
+        function preprocess(imgEl) {
+            const canvas = document.createElement('canvas');
+            canvas.width = CONFIG.imgSize;
+            canvas.height = CONFIG.imgSize;
+            const ctx = canvas.getContext('2d');
+            
+            ctx.fillStyle = '#000000';
+            ctx.fillRect(0, 0, CONFIG.imgSize, CONFIG.imgSize);
+
+            const scale = Math.min(CONFIG.imgSize / imgEl.naturalWidth, CONFIG.imgSize / imgEl.naturalHeight);
+            const nw = imgEl.naturalWidth * scale;
+            const nh = imgEl.naturalHeight * scale;
+            
+            padX = (CONFIG.imgSize - nw) / 2;
+            padY = (CONFIG.imgSize - nh) / 2;
+            letterboxScale = scale;
+
+            ctx.imageSmoothingEnabled = true;
+            ctx.drawImage(imgEl, padX, padY, nw, nh);
+
+            const imgData = ctx.getImageData(0, 0, CONFIG.imgSize, CONFIG.imgSize);
+            const { data } = imgData;
+
+            const numPixels = CONFIG.imgSize * CONFIG.imgSize;
+            const floatBuffer = new Float32Array(1 * 3 * numPixels);
+
+            let rOffset = 0;
+            let gOffset = numPixels;
+            let bOffset = numPixels * 2;
+
+            for (let i = 0; i < numPixels; i++) {
+                floatBuffer[rOffset + i] = data[i * 4] / 255.0;
+                floatBuffer[gOffset + i] = data[i * 4 + 1] / 255.0;
+                floatBuffer[bOffset + i] = data[i * 4 + 2] / 255.0;
+            }
+
+            return new ort.Tensor('float32', floatBuffer, [1, 3, CONFIG.imgSize, CONFIG.imgSize]);
+        }
+
+        async function runDiagnostics() {
+            statusHud.textContent = "Running tensor convolutions...";
+            const inputTensor = preprocess(inputImg);
+            
+            const feeds = {};
+            feeds[session.inputNames[0]] = inputTensor;
+
+            try {
+                const results = await session.run(feeds);
+                const outputName = session.outputNames[0];
+                const outputRaw = results[outputName].data;  
+                const outputShape = results[outputName].dims; 
+
+                statusHud.textContent = "Parsing detection matrices...";
+                processOutputMatrix(outputRaw, outputShape);
+            } catch (err) {
+                statusHud.textContent = "Inference graph run crash.";
+                console.error(err);
+            }
+        }
+
+        function processOutputMatrix(matrix, shape) {
+            const numCandidates = shape[2]; 
+            let candidates = [];
+
+            for (let c = 0; c < numCandidates; c++) {
+                let maxClassScore = 0;
+                let classId = -1;
+                
+                for (let cl = 0; cl < CONFIG.classes.length; cl++) {
+                    const score = matrix[(4 + cl) * numCandidates + c];
+                    if (score > maxClassScore) {
+                        maxClassScore = score;
+                        classId = cl;
+                    }
+                }
+
+                if (maxClassScore >= CONFIG.confThreshold) {
+                    const cx = matrix[0 * numCandidates + c];
+                    const cy = matrix[1 * numCandidates + c];
+                    const w  = matrix[2 * numCandidates + c];
+                    const h  = matrix[3 * numCandidates + c];
+
+                    const x1 = (cx - w / 2 - padX) / letterboxScale;
+                    const y1 = (cy - h / 2 - padY) / letterboxScale;
+                    const rw = w / letterboxScale;
+                    const rh = h / letterboxScale;
+
+                    candidates.push({ x1, y1, w: rw, h: rh, score: maxClassScore, classId });
+                }
+            }
+
+            const filteredBoxes = applyNMS(candidates, CONFIG.iouThreshold);
+            
+            const displayWidth = inputImg.clientWidth;
+            const displayHeight = inputImg.clientHeight;
+            
+            outputCanvas.width = displayWidth;
+            outputCanvas.height = displayHeight;
+            
+            const ctx = outputCanvas.getContext('2d');
+            ctx.clearRect(0, 0, displayWidth, displayHeight);
+
+            const viewScaleX = displayWidth / inputImg.naturalWidth;
+            const viewScaleY = displayHeight / inputImg.naturalHeight;
+
+            filteredBoxes.forEach(box => {
+                const rx = box.x1 * viewScaleX;
+                const ry = box.y1 * viewScaleY;
+                const rw = box.w * viewScaleX;
+                const rh = box.h * viewScaleY;
+                const color = CONFIG.colors[box.classId] || '#38bdf8';
+
+                ctx.fillStyle = color + "1a"; 
+                ctx.fillRect(rx, ry, rw, rh);
+
+                ctx.strokeStyle = color;
+                ctx.lineWidth = 4;
+                ctx.lineJoin = "round";
+                ctx.strokeRect(rx, ry, rw, rh);
+
+                ctx.fillStyle = color;
+                const textLabel = ` ${CONFIG.classes[box.classId].toUpperCase()} ${(box.score * 100).toFixed(0)}% `;
+                ctx.font = 'bold 14px "Segoe UI", Roboto, sans-serif'; 
+                const labelWidth = ctx.measureText(textLabel).width;
+                const ribbonHeight = 24;
+                
+                ctx.fillRect(rx - 2, ry - ribbonHeight, labelWidth + 4, ribbonHeight);
+
+                ctx.fillStyle = '#ffffff';
+                ctx.textBaseline = "middle";
+                ctx.fillText(textLabel, rx, ry - (ribbonHeight / 2));
+            });
+
+            statusHud.textContent = `Analysis complete. Detected zones: ${filteredBoxes.length}`;
+        }
+
+        function applyNMS(candidates, iouThresh) {
+            candidates.sort((a, b) => b.score - a.score);
+            const selected = [];
+            const isActive = new Array(candidates.length).fill(true);
+
+            for (let i = 0; i < candidates.length; i++) {
+                if (!isActive[i]) continue;
+                let boxA = candidates[i];
+                selected.push(boxA);
+
+                for (let j = i + 1; j < candidates.length; j++) {
+                    if (!isActive[j]) continue;
+                    const boxB = candidates[j];
+
+                    if (boxA.classId === boxB.classId) {
+                        const iou = calculateIoU(boxA, boxB);
+                        
+                        if (iou > iouThresh) {
+                            isActive[j] = false;
+                            
+                            const x1 = Math.min(boxA.x1, boxB.x1);
+                            const y1 = Math.min(boxA.y1, boxB.y1);
+                            const x2 = Math.max(boxA.x1 + boxA.w, boxB.x1 + boxB.w);
+                            const y2 = Math.max(boxA.y1 + boxA.h, boxB.y1 + boxB.h);
+                            
+                            boxA.x1 = x1;
+                            boxA.y1 = y1;
+                            boxA.w = x2 - x1;
+                            boxA.h = y2 - y1;
+                        }
+                    }
+                }
+            }
+            return selected;
+        }
+
+        function calculateIoU(boxA, boxB) {
+            const ax2 = boxA.x1 + boxA.w;
+            const ay2 = boxA.y1 + boxA.h;
+            const bx2 = boxB.x1 + boxB.w;
+            const by2 = boxB.y1 + boxB.h;
+
+            const x1 = Math.max(boxA.x1, boxB.x1);
+            const y1 = Math.max(boxA.y1, boxB.y1);
+            const x2 = Math.min(ax2, bx2);
+            const y2 = Math.min(ay2, by2);
+
+            const interArea = Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
+            const areaA = boxA.w * boxA.h;
+            const areaB = boxB.w * boxB.h;
+            
+            return interArea / (areaA + areaB - interArea);
+        }
+
+        window.onload = initModelEngine;
+    </script>
+</body>
+</html>
