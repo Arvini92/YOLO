@@ -1,6 +1,7 @@
 import os
 from roboflow import Roboflow
 from ultralytics import YOLO
+from dotenv import load_dotenv
 
 def main():
     # Load environment variables from .env file
